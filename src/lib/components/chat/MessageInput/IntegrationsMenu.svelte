@@ -39,6 +39,8 @@
 	export let imageGenerationEnabled = false;
 	export let showCodeInterpreterButton = false;
 	export let codeInterpreterEnabled = false;
+	export let showLongMemoryButton = false;
+	export let longMemoryEnabled = false;
 
 	export let onShowValves: Function;
 	export let onClose: Function;
@@ -211,6 +213,37 @@
 								</button>
 							</Tooltip>
 						{/each}
+					{/if}
+
+					{#if showLongMemoryButton}
+						<Tooltip content={$i18n.t('Long Memory')} placement="top-start">
+							<button
+								class="flex w-full justify-between gap-2 items-center px-3 py-1.5 text-sm cursor-pointer rounded-xl hover:bg-gray-50 dark:hover:bg-gray-800/50"
+								on:click={() => {
+									longMemoryEnabled = !longMemoryEnabled;
+								}}
+							>
+								<div class="flex-1 truncate">
+									<div class="flex flex-1 gap-2 items-center">
+										<div class="shrink-0">
+											<Sparkles className="size-4" strokeWidth="1.75" />
+										</div>
+
+										<div class=" truncate">{$i18n.t('Long Memory')}</div>
+									</div>
+								</div>
+
+								<div class=" shrink-0">
+									<Switch
+										state={longMemoryEnabled}
+										on:change={async (e) => {
+											const state = e.detail;
+											await tick();
+										}}
+									/>
+								</div>
+							</button>
+						</Tooltip>
 					{/if}
 
 					{#if showWebSearchButton}

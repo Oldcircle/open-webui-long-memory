@@ -138,6 +138,7 @@
 	let imageGenerationEnabled = false;
 	let webSearchEnabled = false;
 	let codeInterpreterEnabled = false;
+	let longMemoryEnabled = false;
 
 	let showCommands = false;
 
@@ -184,6 +185,7 @@
 		selectedFilterIds = [];
 		webSearchEnabled = false;
 		imageGenerationEnabled = false;
+		longMemoryEnabled = $settings?.longMemory ?? false;
 
 		const storageChatInput = sessionStorage.getItem(
 			`chat-input${chatIdProp ? `-${chatIdProp}` : ''}`
@@ -1906,6 +1908,11 @@
 			features = { ...features, memory: true };
 		}
 
+		if (longMemoryEnabled) {
+			const k = Math.max(1, parseInt(`${$settings?.longMemoryK ?? 3}`));
+			features = { ...features, long_memory: { enabled: true, k } };
+		}
+
 		return features;
 	};
 
@@ -2667,6 +2674,7 @@
 									bind:imageGenerationEnabled
 									bind:codeInterpreterEnabled
 									bind:webSearchEnabled
+									bind:longMemoryEnabled
 									bind:atSelectedModel
 									bind:showCommands
 									toolServers={$toolServers}
@@ -2737,6 +2745,7 @@
 									bind:imageGenerationEnabled
 									bind:codeInterpreterEnabled
 									bind:webSearchEnabled
+									bind:longMemoryEnabled
 									bind:atSelectedModel
 									bind:showCommands
 									toolServers={$toolServers}

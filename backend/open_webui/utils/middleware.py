@@ -56,6 +56,12 @@ from open_webui.routers.pipelines import (
     process_pipeline_outlet_filter,
 )
 from open_webui.routers.memories import query_memory, QueryMemoryForm
+from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
+from open_webui.long_memory import (
+    LongMemoryConfig,
+    LongMemoryService,
+    NomicSentenceTransformerEmbedding,
+)
 
 from open_webui.utils.webhook import post_webhook
 from open_webui.utils.files import (
@@ -1262,6 +1268,99 @@ async def chat_memory_handler(
     return form_data
 
 
+def _get_long_memory_service(request: Request) -> LongMemoryService:
+    service = getattr(request.app.state, "LONG_MEMORY_SERVICE", None)
+    if service is not None:
+        return service
+
+    embedding = NomicSentenceTransformerEmbedding()
+    service = LongMemoryService(
+        vector_store=VECTOR_DB_CLIENT,
+        embedding=embedding,
+        config=LongMemoryConfig(),
+    )
+    request.app.state.LONG_MEMORY_SERVICE = service
+    return service
+
+
+async def _extract_assistant_content_from_completion_response(response) -> Optional[str]:
+    if isinstance(response, dict):
+        if response.get("choices") and response["choices"][0].get("message", {}).get(
+            "content"
+        ):
+            return response["choices"][0]["message"]["content"]
+        if response.get("choices") and response["choices"][0].get("delta", {}).get(
+            "content"
+        ):
+            return response["choices"][0]["delta"]["content"]
+        return None
+
+    if isinstance(response, JSONResponse) and isinstance(response.body, bytes):
+        try:
+            data = json.loads(response.body.decode("utf-8", "replace"))
+            if data.get("choices") and data["choices"][0].get("message", {}).get(
+                "content"
+            ):
+                return data["choices"][0]["message"]["content"]
+        except Exception:
+            return None
+
+    return None
+
+
+async def chat_long_memory_handler(
+    request: Request, form_data: dict, extra_params: dict, user, k: int
+):
+    service = _get_long_memory_service(request)
+
+    async def llm(messages: list[dict[str, Any]]) -> str:
+        payload = {
+            "model": form_data.get("model"),
+            "messages": messages,
+            "stream": False,
+            "metadata": {
+                **(form_data.get("metadata") or {}),
+                "task": "long_memory",
+                "chat_id": (form_data.get("metadata") or {}).get("chat_id", None),
+            },
+        }
+        res = await generate_chat_completion(
+            request=request, form_data=payload, user=user, bypass_filter=True
+        )
+        content = await _extract_assistant_content_from_completion_response(res)
+        return content or ""
+
+    try:
+        need = await service.check_need(llm, form_data.get("messages", []))
+    except Exception as e:
+        log.debug(e)
+        return form_data
+
+    if not need.need or not need.queries:
+        return form_data
+
+    try:
+        recalled = await service.recall(
+            user_id=user.id,
+            queries=need.queries,
+            k=k,
+            user=user,
+        )
+    except Exception as e:
+        log.debug(e)
+        return form_data
+
+    if recalled.items:
+        memory_context = "\n".join([f"- {it.text}" for it in recalled.items])
+        form_data["messages"] = add_or_update_system_message(
+            f"Long-Term Memory:\n{memory_context}\n",
+            form_data["messages"],
+            append=True,
+        )
+
+    return form_data
+
+
 async def chat_web_search_handler(
     request: Request, form_data: dict, extra_params: dict, user
 ):
@@ -2166,6 +2265,22 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                     request, form_data, extra_params, user
                 )
 
+        if "long_memory" in features and features["long_memory"]:
+            long_memory_cfg = features.get("long_memory")
+            enabled = True
+            k = 3
+            if isinstance(long_memory_cfg, dict):
+                enabled = bool(long_memory_cfg.get("enabled", True))
+                k = int(long_memory_cfg.get("k", 3) or 3)
+            else:
+                enabled = bool(long_memory_cfg)
+
+            if enabled:
+                metadata["long_memory"] = {"enabled": True, "k": k}
+                form_data = await chat_long_memory_handler(
+                    request, form_data, extra_params, user, k=k
+                )
+
         if "web_search" in features and features["web_search"]:
             # Skip forced RAG web search when native FC is enabled - model can use web_search tool
             if metadata.get("params", {}).get("function_calling") != "native":
@@ -2698,6 +2813,55 @@ async def background_tasks_handler(ctx):
             message["model"] = form_data.get("model")
 
     if message and "model" in message:
+        long_memory_cfg = metadata.get("long_memory") if isinstance(metadata, dict) else None
+        if isinstance(long_memory_cfg, dict) and long_memory_cfg.get("enabled") and user:
+            async def _long_memory_store_task():
+                try:
+                    service = _get_long_memory_service(request)
+                    user_text = get_last_user_message(messages) or ""
+                    assistant_text = get_last_assistant_message(messages) or ""
+
+                    if not user_text.strip() or not assistant_text.strip():
+                        return
+
+                    async def llm(llm_messages: list[dict[str, Any]]) -> str:
+                        payload = {
+                            "model": message["model"],
+                            "messages": llm_messages,
+                            "stream": False,
+                            "metadata": {
+                                "task": "long_memory_summarize",
+                                "chat_id": metadata.get("chat_id", None),
+                                "message_id": metadata.get("message_id", None),
+                            },
+                        }
+                        res = await generate_chat_completion(
+                            request=request,
+                            form_data=payload,
+                            user=user,
+                            bypass_filter=True,
+                        )
+                        content = await _extract_assistant_content_from_completion_response(res)
+                        return content or ""
+
+                    memories = await service.summarize(
+                        llm,
+                        user_text=user_text,
+                        assistant_text=assistant_text,
+                    )
+                    if memories:
+                        await service.store(
+                            user_id=user.id,
+                            memories=memories,
+                            user=user,
+                            chat_id=metadata.get("chat_id", None),
+                            message_id=metadata.get("message_id", None),
+                        )
+                except Exception as e:
+                    log.debug(e)
+
+            asyncio.create_task(_long_memory_store_task())
+
         if tasks and messages:
             if (
                 TASKS.FOLLOW_UP_GENERATION in tasks

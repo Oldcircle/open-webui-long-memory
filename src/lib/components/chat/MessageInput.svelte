@@ -121,6 +121,7 @@
 	export let imageGenerationEnabled = false;
 	export let webSearchEnabled = false;
 	export let codeInterpreterEnabled = false;
+	export let longMemoryEnabled = false;
 
 	export let messageQueue: { id: string; prompt: string; files: any[] }[] = [];
 	export let onQueueSendNow: (id: string) => void = () => {};
@@ -500,6 +501,8 @@
 			codeInterpreterCapableModels.length &&
 		$config?.features?.enable_code_interpreter &&
 		($_user.role === 'admin' || $_user?.permissions?.features?.code_interpreter);
+
+	let showLongMemoryButton = true;
 
 	const scrollToBottom = () => {
 		const element = document.getElementById('messages-container');
@@ -1543,7 +1546,7 @@
 										</div>
 									</InputMenu>
 
-									{#if showWebSearchButton || showImageGenerationButton || showCodeInterpreterButton || showToolsButton || (toggleFilters && toggleFilters.length > 0)}
+									{#if showLongMemoryButton || showWebSearchButton || showImageGenerationButton || showCodeInterpreterButton || showToolsButton || (toggleFilters && toggleFilters.length > 0)}
 										<div
 											class="flex self-center w-[1px] h-4 mx-1 bg-gray-200/50 dark:bg-gray-800/50"
 										/>
@@ -1551,11 +1554,13 @@
 										<IntegrationsMenu
 											selectedModels={atSelectedModel ? [atSelectedModel.id] : selectedModels}
 											{toggleFilters}
+											{showLongMemoryButton}
 											{showWebSearchButton}
 											{showImageGenerationButton}
 											{showCodeInterpreterButton}
 											bind:selectedToolIds
 											bind:selectedFilterIds
+											bind:longMemoryEnabled
 											bind:webSearchEnabled
 											bind:imageGenerationEnabled
 											bind:codeInterpreterEnabled

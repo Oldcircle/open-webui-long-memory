@@ -15,9 +15,13 @@
 
 	// Addons
 	let enableMemory = false;
+	let enableLongMemory = false;
+	let longMemoryK = 3;
 
 	onMount(async () => {
 		enableMemory = $settings?.memory ?? false;
+		enableLongMemory = $settings?.longMemory ?? false;
+		longMemoryK = $settings?.longMemoryK ?? 3;
 	});
 </script>
 
@@ -52,6 +56,43 @@
 							saveSettings({ memory: enableMemory });
 						}}
 					/>
+				</div>
+			</div>
+		</div>
+
+		<div class="mt-5">
+			<div class="flex items-center justify-between mb-1">
+				<div class="text-sm font-medium">
+					{$i18n.t('Long Memory')}
+				</div>
+
+				<div class="">
+					<Switch
+						bind:state={enableLongMemory}
+						on:change={async () => {
+							saveSettings({ longMemory: enableLongMemory, longMemoryK });
+						}}
+					/>
+				</div>
+			</div>
+
+			<div class="text-xs text-gray-600 dark:text-gray-400">
+				<div class="flex items-center justify-between gap-3">
+					<div class="flex-1">
+						{$i18n.t('Top-K Recall')}
+					</div>
+					<div class="flex items-center relative text-xs px-3">
+						<input
+							type="number"
+							min="1"
+							step="1"
+							bind:value={longMemoryK}
+							class=" text-sm text-right bg-transparent dark:text-gray-300 outline-hidden w-14"
+							on:change={() => {
+								saveSettings({ longMemory: enableLongMemory, longMemoryK });
+							}}
+						/>
+					</div>
 				</div>
 			</div>
 		</div>

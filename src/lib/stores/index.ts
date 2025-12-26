@@ -43,7 +43,7 @@ export const shortCodesToEmojis = writable(
 		}
 
 		return acc;
-	}, {})
+	}, {} as Record<string, string>)
 );
 
 export const TTSWorker = writable(null);
@@ -181,6 +181,8 @@ type Settings = {
 	userLocation?: any;
 	webSearch?: any;
 	memory?: boolean;
+	longMemory?: boolean;
+	longMemoryK?: number;
 	autoTags?: boolean;
 	autoFollowUps?: boolean;
 	splitLargeChunks?(body: any, splitLargeChunks: any): unknown;
