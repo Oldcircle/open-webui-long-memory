@@ -1,15 +1,19 @@
 <script lang="ts">
 	import { toast } from 'svelte-sonner';
 	import dayjs from 'dayjs';
-	import { getContext, createEventDispatcher } from 'svelte';
-
-	const dispatch = createEventDispatcher();
+	import { getContext } from 'svelte';
 
 	import Modal from '$lib/components/common/Modal.svelte';
 	import AddMemoryModal from './AddMemoryModal.svelte';
-	import { deleteMemoriesByUserId, deleteMemoryById, getMemories } from '$lib/apis/memories';
+	import {
+		deleteLongMemoriesByUserId,
+		deleteLongMemoryById,
+		deleteMemoriesByUserId,
+		deleteMemoryById,
+		getLongMemories,
+		getMemories
+	} from '$lib/apis/memories';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
-	import { error } from '@sveltejs/kit';
 	import EditMemoryModal from './EditMemoryModal.svelte';
 	import localizedFormat from 'dayjs/plugin/localizedFormat';
 	import ConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
@@ -20,32 +24,60 @@
 	export let show = false;
 
 	let memories = [];
-	let loading = true;
+	let longMemories = [];
+
+	let loadingMemories = true;
+	let loadingLongMemories = true;
+
+	let tab: 'memory' | 'long_memory' = 'memory';
+	$: currentMemories = tab === 'memory' ? memories : longMemories;
 
 	let showAddMemoryModal = false;
 	let showEditMemoryModal = false;
+	let modalType: 'memory' | 'long_memory' = 'memory';
 
 	let selectedMemory = null;
 
 	let showClearConfirmDialog = false;
 
 	let onClearConfirmed = async () => {
-		const res = await deleteMemoriesByUserId(localStorage.token).catch((error) => {
+		const action =
+			tab === 'memory' ? deleteMemoriesByUserId(localStorage.token) : deleteLongMemoriesByUserId(localStorage.token);
+
+		const res = await action.catch((error) => {
 			toast.error(`${error}`);
 			return null;
 		});
 
-		if (res && memories.length > 0) {
+		if (res && currentMemories.length > 0) {
 			toast.success($i18n.t('Memory cleared successfully'));
-			memories = [];
+			if (tab === 'memory') {
+				memories = [];
+			} else {
+				longMemories = [];
+			}
 		}
 		showClearConfirmDialog = false;
 	};
 
-	$: if (show && memories.length === 0 && loading) {
+	const loadMemories = async () => {
+		memories = await getMemories(localStorage.token);
+		loadingMemories = false;
+	};
+
+	const loadLongMemories = async () => {
+		longMemories = await getLongMemories(localStorage.token);
+		loadingLongMemories = false;
+	};
+
+	$: if (show) {
 		(async () => {
-			memories = await getMemories(localStorage.token);
-			loading = false;
+			if (loadingMemories && memories.length === 0) {
+				await loadMemories();
+			}
+			if (loadingLongMemories && longMemories.length === 0) {
+				await loadLongMemories();
+			}
 		})();
 	}
 </script>
@@ -53,7 +85,33 @@
 <Modal size="lg" bind:show>
 	<div>
 		<div class=" flex justify-between dark:text-gray-300 px-5 pt-4 pb-1">
-			<div class=" text-lg font-medium self-center">{$i18n.t('Memory')}</div>
+			<div class=" flex items-center gap-2">
+				<div class=" text-lg font-medium self-center">{$i18n.t('Memory')}</div>
+				<div class="flex text-xs font-medium gap-1.5">
+					<button
+						type="button"
+						class="px-2 py-1 rounded-2xl outline outline-1 {tab === 'memory'
+							? 'bg-black/5 dark:bg-white/5 outline-gray-100 dark:outline-gray-800'
+							: 'outline-transparent hover:bg-black/5 dark:hover:bg-white/5'}"
+						on:click={() => {
+							tab = 'memory';
+						}}
+					>
+						{$i18n.t('Memory')}
+					</button>
+					<button
+						type="button"
+						class="px-2 py-1 rounded-2xl outline outline-1 {tab === 'long_memory'
+							? 'bg-black/5 dark:bg-white/5 outline-gray-100 dark:outline-gray-800'
+							: 'outline-transparent hover:bg-black/5 dark:hover:bg-white/5'}"
+						on:click={() => {
+							tab = 'long_memory';
+						}}
+					>
+						{$i18n.t('Long Memory')}
+					</button>
+				</div>
+			</div>
 			<button
 				class="self-center"
 				on:click={() => {
@@ -77,7 +135,7 @@
 			<div
 				class=" flex flex-col w-full sm:flex-row sm:justify-center sm:space-x-6 h-[28rem] max-h-screen rounded-xl mb-4 mt-1"
 			>
-				{#if memories.length > 0}
+				{#if currentMemories.length > 0}
 					<div class="text-left text-sm w-full mb-4 overflow-y-scroll">
 						<div class="relative overflow-x-auto">
 							<table class="w-full text-sm text-left text-gray-600 dark:text-gray-400 table-auto">
@@ -93,7 +151,7 @@
 									</tr>
 								</thead>
 								<tbody>
-									{#each memories as memory}
+									{#each currentMemories as memory}
 										<tr class="border-b border-gray-50 dark:border-gray-850/30 items-center">
 											<td class="px-3 py-1">
 												<div class="line-clamp-1">
@@ -112,6 +170,7 @@
 															class="self-center w-fit text-sm px-2 py-2 hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
 															on:click={() => {
 																selectedMemory = memory;
+																modalType = tab;
 																showEditMemoryModal = true;
 															}}
 														>
@@ -136,17 +195,23 @@
 														<button
 															class="self-center w-fit text-sm px-2 py-2 hover:bg-black/5 dark:hover:bg-white/5 rounded-xl"
 															on:click={async () => {
-																const res = await deleteMemoryById(
-																	localStorage.token,
-																	memory.id
-																).catch((error) => {
+																const action =
+																	tab === 'memory'
+																		? deleteMemoryById(localStorage.token, memory.id)
+																		: deleteLongMemoryById(localStorage.token, memory.id);
+
+																const res = await action.catch((error) => {
 																	toast.error(`${error}`);
 																	return null;
 																});
 
 																if (res) {
 																	toast.success($i18n.t('Memory deleted successfully'));
-																	memories = await getMemories(localStorage.token);
+																	if (tab === 'memory') {
+																		memories = await getMemories(localStorage.token);
+																	} else {
+																		longMemories = await getLongMemories(localStorage.token);
+																	}
 																}
 															}}
 														>
@@ -186,13 +251,14 @@
 				<button
 					class=" px-3.5 py-1.5 font-medium hover:bg-black/5 dark:hover:bg-white/5 outline outline-1 outline-gray-100 dark:outline-gray-800 rounded-3xl"
 					on:click={() => {
+						modalType = tab;
 						showAddMemoryModal = true;
 					}}>{$i18n.t('Add Memory')}</button
 				>
 				<button
 					class=" px-3.5 py-1.5 font-medium text-red-500 hover:bg-black/5 dark:hover:bg-white/5 outline outline-1 outline-red-100 dark:outline-red-800 rounded-3xl"
 					on:click={() => {
-						if (memories.length > 0) {
+						if (currentMemories.length > 0) {
 							showClearConfirmDialog = true;
 						} else {
 							toast.error($i18n.t('No memories to clear'));
@@ -216,15 +282,25 @@
 
 <AddMemoryModal
 	bind:show={showAddMemoryModal}
+	type={modalType}
 	on:save={async () => {
-		memories = await getMemories(localStorage.token);
+		if (modalType === 'memory') {
+			memories = await getMemories(localStorage.token);
+		} else {
+			longMemories = await getLongMemories(localStorage.token);
+		}
 	}}
 />
 
 <EditMemoryModal
 	bind:show={showEditMemoryModal}
 	memory={selectedMemory}
+	type={modalType}
 	on:save={async () => {
-		memories = await getMemories(localStorage.token);
+		if (modalType === 'memory') {
+			memories = await getMemories(localStorage.token);
+		} else {
+			longMemories = await getLongMemories(localStorage.token);
+		}
 	}}
 />

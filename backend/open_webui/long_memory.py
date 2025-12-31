@@ -1,10 +1,22 @@
 import asyncio
+import ast
 import json
+import logging
 import re
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional, Protocol, Sequence
+
+from open_webui.env import LONG_MEMORY_DEBUG
+from open_webui.long_memory_prompts import (
+    CHECK_NEED_SYSTEM_PROMPT,
+    MERGE_MEMORIES_SYSTEM_PROMPT,
+    SUMMARIZE_SYSTEM_PROMPT,
+    WRITE_CHECK_AND_EXTRACT_SYSTEM_PROMPT,
+)
+
+log = logging.getLogger(__name__)
 
 
 class LLMComplete(Protocol):
@@ -23,6 +35,17 @@ class VectorStore(Protocol):
     def search(self, collection_name: str, vectors: list[list[float]], limit: int): ...
 
 
+class LongMemorySQLStore(Protocol):
+    def insert_new_long_memory(
+        self,
+        user_id: str,
+        content: str,
+        *,
+        chat_id: Optional[str] = None,
+        message_id: Optional[str] = None,
+    ) -> Any: ...
+
+
 @dataclass(frozen=True)
 class LongMemoryConfig:
     enabled: bool = True
@@ -30,7 +53,7 @@ class LongMemoryConfig:
     collection_name_prefix: str = "user-long-memory-"
     embedding_model: str = "nomic-ai/nomic-embed-text-v1.5"
     max_queries: int = 5
-    max_memories_per_turn: int = 6
+    max_memories_per_turn: int = 30
 
 
 @dataclass(frozen=True)
@@ -52,19 +75,48 @@ class RecallResult:
     items: list[RecallItem]
     queries: list[str]
 
+@dataclass(frozen=True)
+class WriteCheckResult:
+    need: bool
+    memories: list[str]
+
+
+def _parse_json_like_object(candidate: str) -> Optional[dict[str, Any]]:
+    candidate = (candidate or "").strip()
+    if not candidate:
+        return None
+
+    try:
+        obj = json.loads(candidate)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        pass
+
+    try:
+        normalized = re.sub(r"\btrue\b", "True", candidate, flags=re.I)
+        normalized = re.sub(r"\bfalse\b", "False", normalized, flags=re.I)
+        normalized = re.sub(r"\bnull\b", "None", normalized, flags=re.I)
+        obj = ast.literal_eval(normalized)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
 
 def _extract_first_json_object(text: str) -> Optional[dict[str, Any]]:
+    text = text or ""
     if not text:
         return None
+
+    for match in re.finditer(r"\{[\s\S]*?\}", text):
+        obj = _parse_json_like_object(match.group(0))
+        if obj is not None:
+            return obj
+
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
         return None
-    candidate = text[start : end + 1]
-    try:
-        return json.loads(candidate)
-    except Exception:
-        return None
+    return _parse_json_like_object(text[start : end + 1])
 
 
 def _normalize_query(q: str) -> str:
@@ -193,32 +245,48 @@ class LongMemoryService:
         *,
         vector_store: VectorStore,
         embedding: Embedding,
+        sql_store: Optional[LongMemorySQLStore] = None,
         config: LongMemoryConfig = LongMemoryConfig(),
     ):
         self.vector_store = vector_store
         self.embedding = embedding
+        self.sql_store = sql_store
         self.config = config
 
     def _collection_name(self, user_id: str) -> str:
         return f"{self.config.collection_name_prefix}{user_id}"
 
     async def check_need(self, llm: LLMComplete, messages: list[dict[str, Any]]) -> NeedCheckResult:
-        recent = messages[-10:] if len(messages) > 10 else messages
+        user_text = ""
+        for msg in reversed(messages or []):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                user_text = content
+            else:
+                user_text = json.dumps(content, ensure_ascii=False)
+            break
+        return await self.check_need_by_user_text(llm, user_text=user_text)
 
+    async def check_need_by_user_text(self, llm: LLMComplete, *, user_text: str) -> NeedCheckResult:
         prompt = [
             {
                 "role": "system",
-                "content": (
-                    "你是一个长期记忆路由器。给定对话上下文，判断是否需要从长期记忆中召回信息。"
-                    "只输出JSON，格式：{\"need\": boolean, \"queries\": [string]}。"
-                    "queries用于向量检索，必须是简短分点，不要重复，最多5条；如果need为false，queries必须为空数组。"
-                ),
+                "content": CHECK_NEED_SYSTEM_PROMPT,
             },
             {
                 "role": "user",
-                "content": json.dumps({"messages": recent}, ensure_ascii=False),
+                "content": json.dumps({"user": user_text or ""}, ensure_ascii=False),
             },
         ]
+
+        if LONG_MEMORY_DEBUG:
+            log.info(
+                "long_memory check_need prompt: user_len=%s user_text=%s",
+                len(user_text or ""),
+                (user_text or "")[:500],
+            )
 
         text = await llm(prompt)
         obj = _extract_first_json_object(text) or {}
@@ -230,6 +298,8 @@ class LongMemoryService:
         if not need:
             queries = []
         queries = queries[: self.config.max_queries]
+        if LONG_MEMORY_DEBUG:
+            log.info("long_memory check_need parsed: need=%s queries=%s", need, queries)
         return NeedCheckResult(need=need, queries=queries)
 
     async def recall(
@@ -243,6 +313,15 @@ class LongMemoryService:
         queries = _dedupe_keep_order(queries)[: self.config.max_queries]
         if not queries:
             return RecallResult(items=[], queries=[])
+
+        if LONG_MEMORY_DEBUG:
+            log.info(
+                "long_memory recall start: user_id=%s collection=%s k=%s queries=%s",
+                user_id,
+                self._collection_name(user_id),
+                k,
+                queries,
+            )
 
         vectors = await self.embedding(queries, user=user)
         if not isinstance(vectors, list) or (vectors and not isinstance(vectors[0], list)):
@@ -261,11 +340,38 @@ class LongMemoryService:
                     vectors=[vec],
                     limit=per_query_limit,
                 )
-            except Exception:
+            except Exception as e:
+                if LONG_MEMORY_DEBUG:
+                    log.info(
+                        "long_memory recall search failed: query_idx=%s query=%s err=%s",
+                        q_idx,
+                        queries[q_idx] if q_idx < len(queries) else "",
+                        repr(e),
+                    )
                 continue
 
             picked = 0
-            for item in _flatten_vector_search_results(results):
+            flattened = _flatten_vector_search_results(results)
+            if LONG_MEMORY_DEBUG:
+                log.info(
+                    "long_memory recall search result: query_idx=%s query=%s raw_items=%s",
+                    q_idx,
+                    queries[q_idx] if q_idx < len(queries) else "",
+                    len(flattened),
+                )
+                log.info(
+                    "long_memory recall top_items: %s",
+                    [
+                        {
+                            "id": it.id,
+                            "score": it.score,
+                            "text": (it.text or "")[:200],
+                            "metadata": it.metadata,
+                        }
+                        for it in flattened[: min(10, len(flattened))]
+                    ],
+                )
+            for item in flattened:
                 if picked >= k:
                     break
                 key = item.text.strip()
@@ -277,26 +383,121 @@ class LongMemoryService:
                 all_items.append(item)
                 picked += 1
 
+        if LONG_MEMORY_DEBUG:
+            log.info(
+                "long_memory recall picked: items=%s queries=%s",
+                len(all_items),
+                queries,
+            )
         return RecallResult(items=all_items, queries=queries)
 
-    async def summarize(self, llm: LLMComplete, *, user_text: str, assistant_text: str) -> list[str]:
+    async def find_similar_existing_memories(
+        self,
+        *,
+        user_id: str,
+        memories: list[str],
+        k_per_memory: int = 5,
+        min_similarity: float = 0.8,
+        user: Any = None,
+    ) -> list[RecallItem]:
+        memories = _dedupe_keep_order(memories)
+        if not memories:
+            return []
+
+        if LONG_MEMORY_DEBUG:
+            log.info(
+                "long_memory find_similar start: user_id=%s collection=%s memories=%s k_per=%s min_score=%s",
+                user_id,
+                self._collection_name(user_id),
+                [(m or "")[:200] for m in memories],
+                k_per_memory,
+                min_similarity,
+            )
+
+        k_per_memory = max(1, int(k_per_memory))
+        min_similarity = float(min_similarity)
+
+        vectors = await self.embedding(memories, user=user)
+        if not isinstance(vectors, list) or (vectors and not isinstance(vectors[0], list)):
+            vectors = [vectors]
+
+        collection = self._collection_name(user_id)
+        out: list[RecallItem] = []
+        seen_ids: set[str] = set()
+
+        for vec in vectors[: len(memories)]:
+            try:
+                results = self.vector_store.search(
+                    collection_name=collection,
+                    vectors=[vec],
+                    limit=k_per_memory,
+                )
+            except Exception as e:
+                if LONG_MEMORY_DEBUG:
+                    log.info("long_memory find_similar search failed: err=%s", repr(e))
+                continue
+
+            picked = 0
+            for item in _flatten_vector_search_results(results):
+                if picked >= k_per_memory:
+                    break
+                score = item.score
+                if score is None or float(score) < min_similarity:
+                    continue
+                if item.id in seen_ids:
+                    continue
+                seen_ids.add(item.id)
+                out.append(item)
+                picked += 1
+
+        if LONG_MEMORY_DEBUG:
+            log.info(
+                "long_memory find_similar picked: items=%s details=%s",
+                len(out),
+                [
+                    {
+                        "id": it.id,
+                        "score": it.score,
+                        "text": (it.text or "")[:200],
+                        "metadata": it.metadata,
+                    }
+                    for it in out[: min(10, len(out))]
+                ],
+            )
+        return out
+
+    async def merge_memories(
+        self,
+        llm: LLMComplete,
+        *,
+        new_memories: list[str],
+        old_memories: list[str],
+    ) -> list[str]:
+        new_memories = _dedupe_keep_order([str(x) for x in (new_memories or [])])
+        old_memories = _dedupe_keep_order([str(x) for x in (old_memories or [])])
+        if not new_memories and not old_memories:
+            return []
+
         prompt = [
             {
                 "role": "system",
-                "content": (
-                    "你是一个长期记忆提取器。基于一轮对话（用户输入+助手输出），提取未来对话中稳定且有用的信息。"
-                    "要求：尽量简短，每条不超过30字；避免重复；不要记录临时信息或纯闲聊；不要输出解释。"
-                    "只输出JSON，格式：{\"memories\": [string]}。"
-                ),
+                "content": MERGE_MEMORIES_SYSTEM_PROMPT,
             },
             {
                 "role": "user",
                 "content": json.dumps(
-                    {"user": user_text or "", "assistant": assistant_text or ""},
+                    {"new_memories": new_memories, "old_memories": old_memories},
                     ensure_ascii=False,
                 ),
             },
         ]
+
+        if LONG_MEMORY_DEBUG:
+            log.info(
+                "long_memory merge prompt: new=%s old=%s",
+                [(m or "")[:200] for m in new_memories],
+                [(m or "")[:200] for m in old_memories],
+            )
 
         text = await llm(prompt)
         obj = _extract_first_json_object(text) or {}
@@ -304,6 +505,75 @@ class LongMemoryService:
         if not isinstance(memories, list):
             memories = []
         memories = _dedupe_keep_order([str(x) for x in memories])
+        if LONG_MEMORY_DEBUG:
+            log.info(
+                "long_memory merge parsed: merged=%s",
+                [(m or "")[:200] for m in memories],
+            )
+        return memories[: self.config.max_memories_per_turn]
+
+    async def check_and_summarize(
+        self, llm: LLMComplete, *, user_text: str, assistant_text: str
+    ) -> WriteCheckResult:
+        prompt = [
+            {
+                "role": "system",
+                "content": WRITE_CHECK_AND_EXTRACT_SYSTEM_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": json.dumps({"user": user_text or ""}, ensure_ascii=False),
+            },
+        ]
+
+        if LONG_MEMORY_DEBUG:
+            log.info(
+                "long_memory write_check prompt: user_len=%s user_text=%s",
+                len(user_text or ""),
+                (user_text or "")[:500],
+            )
+
+        text = await llm(prompt)
+        obj = _extract_first_json_object(text) or {}
+        need = bool(obj.get("need", False))
+        memories = obj.get("memories", [])
+        if not isinstance(memories, list):
+            memories = []
+        memories = _dedupe_keep_order([str(x) for x in memories])
+        if not need:
+            memories = []
+        memories = memories[: self.config.max_memories_per_turn]
+        if LONG_MEMORY_DEBUG:
+            log.info("long_memory write_check parsed: need=%s memories=%s", need, memories)
+        return WriteCheckResult(need=need, memories=memories)
+
+    async def summarize(self, llm: LLMComplete, *, user_text: str, assistant_text: str) -> list[str]:
+        prompt = [
+            {
+                "role": "system",
+                "content": SUMMARIZE_SYSTEM_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": json.dumps({"user": user_text or ""}, ensure_ascii=False),
+            },
+        ]
+
+        if LONG_MEMORY_DEBUG:
+            log.info(
+                "long_memory summarize prompt: user_len=%s user_text=%s",
+                len(user_text or ""),
+                (user_text or "")[:500],
+            )
+
+        text = await llm(prompt)
+        obj = _extract_first_json_object(text) or {}
+        memories = obj.get("memories", [])
+        if not isinstance(memories, list):
+            memories = []
+        memories = _dedupe_keep_order([str(x) for x in memories])
+        if LONG_MEMORY_DEBUG:
+            log.info("long_memory summarize parsed: memories=%s", memories)
         return memories[: self.config.max_memories_per_turn]
 
     async def store(
@@ -319,23 +589,58 @@ class LongMemoryService:
         if not memories:
             return []
 
+        if LONG_MEMORY_DEBUG:
+            log.info(
+                "long_memory store start: user_id=%s memories=%s chat_id=%s message_id=%s",
+                user_id,
+                [(m or "")[:200] for m in memories],
+                chat_id,
+                message_id,
+            )
+
+        now = int(time.time())
+        ids: list[str] = []
+        created_ats: list[int] = []
+        updated_ats: list[int] = []
+
+        for mem in memories:
+            mem_id = str(uuid.uuid4())
+            created_at = now
+            updated_at = now
+
+            if self.sql_store is not None:
+                try:
+                    rec = self.sql_store.insert_new_long_memory(
+                        user_id,
+                        mem,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                    )
+                    if rec is not None:
+                        mem_id = str(getattr(rec, "id", mem_id))
+                        created_at = int(getattr(rec, "created_at", created_at))
+                        updated_at = int(getattr(rec, "updated_at", updated_at))
+                except Exception:
+                    pass
+
+            ids.append(mem_id)
+            created_ats.append(created_at)
+            updated_ats.append(updated_at)
+
         vectors = await self.embedding(memories, user=user)
         if not isinstance(vectors, list) or (vectors and not isinstance(vectors[0], list)):
             vectors = [vectors]
 
-        created_at = int(time.time())
         items = []
-        ids = []
         for idx, mem in enumerate(memories):
-            mem_id = str(uuid.uuid4())
-            ids.append(mem_id)
             items.append(
                 {
-                    "id": mem_id,
+                    "id": ids[idx],
                     "text": mem,
                     "vector": vectors[idx],
                     "metadata": {
-                        "created_at": created_at,
+                        "created_at": created_ats[idx],
+                        "updated_at": updated_ats[idx],
                         **({"chat_id": chat_id} if chat_id else {}),
                         **({"message_id": message_id} if message_id else {}),
                     },
@@ -346,4 +651,11 @@ class LongMemoryService:
             collection_name=self._collection_name(user_id),
             items=items,
         )
+        if LONG_MEMORY_DEBUG:
+            log.info(
+                "long_memory store done: ids=%s count=%s collection=%s",
+                ids,
+                len(ids),
+                self._collection_name(user_id),
+            )
         return ids

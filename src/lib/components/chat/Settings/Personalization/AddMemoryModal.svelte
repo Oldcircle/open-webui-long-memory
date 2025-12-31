@@ -2,7 +2,7 @@
 	import { createEventDispatcher, getContext } from 'svelte';
 
 	import Modal from '$lib/components/common/Modal.svelte';
-	import { addNewMemory, updateMemoryById } from '$lib/apis/memories';
+	import { addNewLongMemory, addNewMemory } from '$lib/apis/memories';
 	import { toast } from 'svelte-sonner';
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import XMark from '$lib/components/icons/XMark.svelte';
@@ -10,6 +10,7 @@
 	const dispatch = createEventDispatcher();
 
 	export let show;
+	export let type = 'memory';
 	const i18n = getContext('i18n');
 
 	let loading = false;
@@ -18,7 +19,12 @@
 	const submitHandler = async () => {
 		loading = true;
 
-		const res = await addNewMemory(localStorage.token, content).catch((error) => {
+		const action =
+			type === 'long_memory'
+				? addNewLongMemory(localStorage.token, content)
+				: addNewMemory(localStorage.token, content);
+
+		const res = await action.catch((error) => {
 			toast.error(`${error}`);
 
 			return null;

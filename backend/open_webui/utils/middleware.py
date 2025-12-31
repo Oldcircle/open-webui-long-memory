@@ -56,12 +56,14 @@ from open_webui.routers.pipelines import (
     process_pipeline_outlet_filter,
 )
 from open_webui.routers.memories import query_memory, QueryMemoryForm
+from open_webui.models.memories import LongMemories
 from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
 from open_webui.long_memory import (
     LongMemoryConfig,
     LongMemoryService,
     NomicSentenceTransformerEmbedding,
 )
+from open_webui.long_memory_prompts import LONG_MEMORY_CONTEXT_TEMPLATE
 
 from open_webui.utils.webhook import post_webhook
 from open_webui.utils.files import (
@@ -136,12 +138,16 @@ from open_webui.env import (
     ENABLE_FORWARD_USER_INFO_HEADERS,
     FORWARD_SESSION_INFO_HEADER_CHAT_ID,
     FORWARD_SESSION_INFO_HEADER_MESSAGE_ID,
+    LONG_MEMORY_DEBUG,
 )
 from open_webui.utils.headers import include_user_info_headers
 from open_webui.constants import TASKS
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
+
+LONG_MEMORY_BATCH_SIZE = 10
+LONG_MEMORY_IDLE_FLUSH_SECONDS = 600
 
 
 DEFAULT_REASONING_TAGS = [
@@ -1277,6 +1283,7 @@ def _get_long_memory_service(request: Request) -> LongMemoryService:
     service = LongMemoryService(
         vector_store=VECTOR_DB_CLIENT,
         embedding=embedding,
+        sql_store=LongMemories,
         config=LongMemoryConfig(),
     )
     request.app.state.LONG_MEMORY_SERVICE = service
@@ -1312,6 +1319,16 @@ async def chat_long_memory_handler(
     request: Request, form_data: dict, extra_params: dict, user, k: int
 ):
     service = _get_long_memory_service(request)
+    if LONG_MEMORY_DEBUG:
+        metadata = form_data.get("metadata") or {}
+        log.info(
+            "long_memory flow start: user_id=%s chat_id=%s message_id=%s model=%s k=%s",
+            getattr(user, "id", None),
+            metadata.get("chat_id", None),
+            metadata.get("message_id", None),
+            form_data.get("model", None),
+            k,
+        )
 
     async def llm(messages: list[dict[str, Any]]) -> str:
         payload = {
@@ -1328,35 +1345,98 @@ async def chat_long_memory_handler(
             request=request, form_data=payload, user=user, bypass_filter=True
         )
         content = await _extract_assistant_content_from_completion_response(res)
+        if LONG_MEMORY_DEBUG:
+            raw = content or ""
+            log.info(
+                "long_memory check_need llm output: %s",
+                raw[:2000],
+            )
         return content or ""
 
-    try:
-        need = await service.check_need(llm, form_data.get("messages", []))
-    except Exception as e:
-        log.debug(e)
-        return form_data
+    def _should_force_long_memory_recall(user_text: str) -> bool:
+        user_text = (user_text or "").strip().lower()
+        if not user_text:
+            return False
+        keywords = [
+            "记得",
+            "记住",
+            "回忆",
+            "之前",
+            "上次",
+            "以前",
+            "关于我",
+            "我的",
+            "我叫",
+            "我是谁",
+            "偏好",
+            "习惯",
+            "生日",
+            "邮箱",
+            "电话",
+            "地址",
+            "remember",
+            "what do you remember",
+            "my name",
+            "who am i",
+            "preference",
+        ]
+        return any(k in user_text for k in keywords)
 
-    if not need.need or not need.queries:
+    messages_for_need_check = form_data.get("messages", [])
+    last_user_message = get_last_user_message(messages_for_need_check) or ""
+
+    need = None
+    try:
+        need = await service.check_need(llm, messages_for_need_check)
+    except Exception as e:
+        log.warning("long_memory check_need failed: %s", e, exc_info=True)
+
+    queries = []
+    if need is not None and getattr(need, "need", False) and getattr(need, "queries", None):
+        queries = list(getattr(need, "queries", []) or [])
+    elif _should_force_long_memory_recall(last_user_message):
+        queries = [last_user_message]
+
+    if LONG_MEMORY_DEBUG:
+        log.info(
+            "long_memory need_check parsed: need=%s queries=%s user_text=%s",
+            (getattr(need, "need", None) if need is not None else None),
+            queries,
+            (last_user_message or "")[:500],
+        )
+
+    if not queries:
+        if LONG_MEMORY_DEBUG:
+            log.info("long_memory recall skipped: no queries")
         return form_data
 
     try:
         recalled = await service.recall(
             user_id=user.id,
-            queries=need.queries,
+            queries=queries,
             k=k,
             user=user,
         )
     except Exception as e:
-        log.debug(e)
+        log.warning("long_memory recall failed: %s", e, exc_info=True)
         return form_data
 
     if recalled.items:
         memory_context = "\n".join([f"- {it.text}" for it in recalled.items])
         form_data["messages"] = add_or_update_system_message(
-            f"Long-Term Memory:\n{memory_context}\n",
+            LONG_MEMORY_CONTEXT_TEMPLATE.format(memory_context=memory_context),
             form_data["messages"],
             append=True,
         )
+        if LONG_MEMORY_DEBUG:
+            log.info(
+                "long_memory recalled %s items: %s",
+                len(recalled.items),
+                [it.text[:200] for it in recalled.items],
+            )
+    else:
+        if LONG_MEMORY_DEBUG:
+            log.info("long_memory recall done: 0 items")
 
     return form_data
 
@@ -2819,18 +2899,25 @@ async def background_tasks_handler(ctx):
                 try:
                     service = _get_long_memory_service(request)
                     user_text = get_last_user_message(messages) or ""
-                    assistant_text = get_last_assistant_message(messages) or ""
-
-                    if not user_text.strip() or not assistant_text.strip():
+                    if not user_text.strip():
                         return
+                    if LONG_MEMORY_DEBUG:
+                        log.info(
+                            "long_memory store flow start: user_id=%s chat_id=%s message_id=%s model=%s user_text=%s",
+                            getattr(user, "id", None),
+                            metadata.get("chat_id", None),
+                            metadata.get("message_id", None),
+                            message.get("model", None),
+                            user_text[:500],
+                        )
 
-                    async def llm(llm_messages: list[dict[str, Any]]) -> str:
+                    async def _complete(task: str, llm_messages: list[dict[str, Any]]) -> str:
                         payload = {
                             "model": message["model"],
                             "messages": llm_messages,
                             "stream": False,
                             "metadata": {
-                                "task": "long_memory_summarize",
+                                "task": task,
                                 "chat_id": metadata.get("chat_id", None),
                                 "message_id": metadata.get("message_id", None),
                             },
@@ -2842,21 +2929,182 @@ async def background_tasks_handler(ctx):
                             bypass_filter=True,
                         )
                         content = await _extract_assistant_content_from_completion_response(res)
+                        if LONG_MEMORY_DEBUG:
+                            log.info(
+                                "long_memory %s llm output: %s",
+                                task,
+                                (content or "")[:2000],
+                            )
                         return content or ""
 
-                    memories = await service.summarize(
-                        llm,
-                        user_text=user_text,
-                        assistant_text=assistant_text,
-                    )
-                    if memories:
-                        await service.store(
+                    async def llm_summarize(llm_messages: list[dict[str, Any]]) -> str:
+                        return await _complete("long_memory_summarize", llm_messages)
+
+                    async def llm_merge(llm_messages: list[dict[str, Any]]) -> str:
+                        return await _complete("long_memory_merge", llm_messages)
+
+                    batch_state = getattr(request.app.state, "LONG_MEMORY_BATCH_STATE", None)
+                    if not isinstance(batch_state, dict):
+                        batch_state = {}
+                        request.app.state.LONG_MEMORY_BATCH_STATE = batch_state
+
+                    user_id = str(getattr(user, "id", "") or "")
+                    chat_id = str(metadata.get("chat_id", "") or "")
+                    batch_key = (user_id, chat_id)
+
+                    entry = batch_state.get(batch_key)
+                    if not isinstance(entry, dict):
+                        entry = {
+                            "pending": [],
+                            "token": 0,
+                            "timer": None,
+                            "last_message_id": None,
+                        }
+                        batch_state[batch_key] = entry
+
+                    pending = entry.get("pending")
+                    if not isinstance(pending, list):
+                        pending = []
+                        entry["pending"] = pending
+
+                    entry["token"] = int(entry.get("token") or 0) + 1
+                    entry["last_message_id"] = metadata.get("message_id", None)
+
+                    timer = entry.get("timer")
+                    if timer is not None and hasattr(timer, "cancel") and not timer.done():
+                        timer.cancel()
+
+                    pending.append(user_text)
+
+                    async def _summarize_and_store(
+                        texts: list[str],
+                        *,
+                        store_message_id: Optional[str],
+                        reason: str,
+                    ):
+                        combined = "\n".join(
+                            [f"{idx+1}. {(t or '').strip()}" for idx, t in enumerate(texts)]
+                        ).strip()
+                        if not combined:
+                            return
+                        if LONG_MEMORY_DEBUG:
+                            log.info(
+                                "long_memory batch summarize start: reason=%s user_id=%s chat_id=%s messages=%s message_id=%s",
+                                reason,
+                                user_id,
+                                chat_id,
+                                len(texts),
+                                store_message_id,
+                            )
+                        memories = await service.summarize(
+                            llm_summarize,
+                            user_text=combined,
+                            assistant_text="",
+                        )
+                        if not memories:
+                            if LONG_MEMORY_DEBUG:
+                                log.info(
+                                    "long_memory batch summarize empty: reason=%s messages=%s",
+                                    reason,
+                                    len(texts),
+                                )
+                            return
+
+                        similar_items = await service.find_similar_existing_memories(
                             user_id=user.id,
                             memories=memories,
+                            k_per_memory=5,
+                            min_similarity=0.8,
+                            user=user,
+                        )
+                        old_ids = [it.id for it in similar_items if getattr(it, "id", None)]
+                        old_texts = [it.text for it in similar_items if getattr(it, "text", None)]
+                        old_ids = list(dict.fromkeys([str(x) for x in old_ids]))
+                        old_texts = list(dict.fromkeys([str(x) for x in old_texts]))
+
+                        merged_memories = []
+                        try:
+                            merged_memories = await service.merge_memories(
+                                llm_merge,
+                                new_memories=memories,
+                                old_memories=old_texts,
+                            )
+                        except Exception:
+                            merged_memories = []
+
+                        if not merged_memories:
+                            merged_memories = memories
+
+                        if old_ids:
+                            for memory_id in old_ids:
+                                try:
+                                    LongMemories.delete_long_memory_by_id_and_user_id(
+                                        memory_id, user.id
+                                    )
+                                except Exception:
+                                    pass
+                            try:
+                                VECTOR_DB_CLIENT.delete(
+                                    collection_name=service._collection_name(user.id),
+                                    ids=old_ids,
+                                )
+                            except Exception:
+                                pass
+
+                        await service.store(
+                            user_id=user.id,
+                            memories=merged_memories,
                             user=user,
                             chat_id=metadata.get("chat_id", None),
-                            message_id=metadata.get("message_id", None),
+                            message_id=store_message_id,
                         )
+                        if LONG_MEMORY_DEBUG:
+                            log.info(
+                                "long_memory batch summarize stored: reason=%s stored=%s",
+                                reason,
+                                len(merged_memories),
+                            )
+
+                    store_message_id = entry.get("last_message_id")
+
+                    while len(pending) >= LONG_MEMORY_BATCH_SIZE:
+                        batch = pending[:LONG_MEMORY_BATCH_SIZE]
+                        try:
+                            await _summarize_and_store(
+                                batch,
+                                store_message_id=store_message_id,
+                                reason=f"batch_{LONG_MEMORY_BATCH_SIZE}",
+                            )
+                            del pending[:LONG_MEMORY_BATCH_SIZE]
+                        except Exception:
+                            break
+
+                    async def _idle_flush(token: int):
+                        await asyncio.sleep(LONG_MEMORY_IDLE_FLUSH_SECONDS)
+                        current = batch_state.get(batch_key)
+                        if not isinstance(current, dict):
+                            return
+                        if int(current.get("token") or 0) != int(token):
+                            return
+                        cur_pending = current.get("pending")
+                        if not isinstance(cur_pending, list) or not cur_pending:
+                            return
+                        cur_message_id = current.get("last_message_id")
+                        texts = list(cur_pending)
+                        try:
+                            await _summarize_and_store(
+                                texts,
+                                store_message_id=cur_message_id,
+                                reason=f"idle_{LONG_MEMORY_IDLE_FLUSH_SECONDS}s",
+                            )
+                            cur_pending.clear()
+                        except Exception:
+                            return
+
+                    if pending:
+                        entry["timer"] = asyncio.create_task(_idle_flush(entry["token"]))
+                    else:
+                        entry["timer"] = None
                 except Exception as e:
                     log.debug(e)
 

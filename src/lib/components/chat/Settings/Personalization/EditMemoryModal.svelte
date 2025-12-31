@@ -2,7 +2,7 @@
 	import { createEventDispatcher, getContext } from 'svelte';
 	import { toast } from 'svelte-sonner';
 
-	import { updateMemoryById } from '$lib/apis/memories';
+	import { updateLongMemoryById, updateMemoryById } from '$lib/apis/memories';
 
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import Modal from '$lib/components/common/Modal.svelte';
@@ -12,6 +12,7 @@
 
 	export let show;
 	export let memory = {};
+	export let type = 'memory';
 
 	const i18n = getContext('i18n');
 
@@ -29,7 +30,12 @@
 	const submitHandler = async () => {
 		loading = true;
 
-		const res = await updateMemoryById(localStorage.token, memory.id, content).catch((error) => {
+		const action =
+			type === 'long_memory'
+				? updateLongMemoryById(localStorage.token, memory.id, content)
+				: updateMemoryById(localStorage.token, memory.id, content);
+
+		const res = await action.catch((error) => {
 			toast.error(`${error}`);
 
 			return null;

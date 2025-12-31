@@ -185,7 +185,7 @@
 		selectedFilterIds = [];
 		webSearchEnabled = false;
 		imageGenerationEnabled = false;
-		longMemoryEnabled = $settings?.longMemory ?? false;
+		longMemoryEnabled = false;
 
 		const storageChatInput = sessionStorage.getItem(
 			`chat-input${chatIdProp ? `-${chatIdProp}` : ''}`
@@ -234,6 +234,9 @@
 						webSearchEnabled = input.webSearchEnabled;
 						imageGenerationEnabled = input.imageGenerationEnabled;
 						codeInterpreterEnabled = input.codeInterpreterEnabled;
+						if (typeof input.longMemoryEnabled === 'boolean') {
+							longMemoryEnabled = input.longMemoryEnabled;
+						}
 					}
 				} catch (e) {}
 			} else {
@@ -600,6 +603,8 @@
 			stopAudio();
 		});
 
+		longMemoryEnabled = false;
+
 		const storageChatInput = sessionStorage.getItem(
 			`chat-input${chatIdProp ? `-${chatIdProp}` : ''}`
 		);
@@ -631,6 +636,9 @@
 					webSearchEnabled = input.webSearchEnabled;
 					imageGenerationEnabled = input.imageGenerationEnabled;
 					codeInterpreterEnabled = input.codeInterpreterEnabled;
+					if (typeof input.longMemoryEnabled === 'boolean') {
+						longMemoryEnabled = input.longMemoryEnabled;
+					}
 				}
 			} catch (e) {}
 		}
@@ -1036,6 +1044,7 @@
 		autoScroll = true;
 
 		resetInput();
+		longMemoryEnabled = false;
 		await chatId.set('');
 		await chatTitle.set('');
 

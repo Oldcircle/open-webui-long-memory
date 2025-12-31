@@ -159,7 +159,8 @@
 		selectedFilterIds,
 		imageGenerationEnabled,
 		webSearchEnabled,
-		codeInterpreterEnabled
+		codeInterpreterEnabled,
+		longMemoryEnabled
 	});
 
 	const inputVariableHandler = async (text: string): Promise<string> => {

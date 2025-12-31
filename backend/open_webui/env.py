@@ -81,6 +81,8 @@ else:
 log = logging.getLogger(__name__)
 log.info(f"GLOBAL_LOG_LEVEL: {GLOBAL_LOG_LEVEL}")
 
+LONG_MEMORY_DEBUG = os.environ.get("LONG_MEMORY_DEBUG", "false").lower() == "true"
+
 if "cuda_error" in locals():
     log.exception(cuda_error)
     del cuda_error
